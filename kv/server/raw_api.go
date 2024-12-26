@@ -45,7 +45,7 @@ func (server *Server) RawPut(_ context.Context, req *kvrpcpb.RawPutRequest) (*kv
 		Value: req.Value,
 		Cf:    req.Cf,
 	}
-	err := server.storage.Write(req.Context, []storage.Modify{{put}})
+	err := server.storage.Write(req.Context, []storage.Modify{{Data: put}})
 	var s string
 	if err != nil {
 		s = err.Error()
@@ -63,7 +63,7 @@ func (server *Server) RawDelete(_ context.Context, req *kvrpcpb.RawDeleteRequest
 		Key: req.Key,
 		Cf:  req.Cf,
 	}
-	err := server.storage.Write(req.Context, []storage.Modify{{del}})
+	err := server.storage.Write(req.Context, []storage.Modify{{Data: del}})
 	var s string
 	if err != nil {
 		s = err.Error()
