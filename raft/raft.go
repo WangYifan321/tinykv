@@ -16,8 +16,13 @@ package raft
 
 import (
 	"errors"
-
+	"fmt"
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"math/rand"
+	"sort"
+	"strings"
+	"time"
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -45,6 +50,8 @@ func (st StateType) String() string {
 // ErrProposalDropped is returned when the proposal is ignored by some cases,
 // so that the proposer can be notified and fail fast.
 var ErrProposalDropped = errors.New("raft proposal dropped")
+
+var globalRand = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 // Config contains the parameters to start a raft.
 type Config struct {
@@ -165,38 +172,176 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	return nil
+	raftLog := newLog(c.Storage)
+	hs, cs, err := c.Storage.InitialState()
+	if err != nil {
+		panic(err)
+	}
+	peers := c.peers
+	if len(cs.Nodes) > 0 {
+		if len(peers) > 0 {
+			panic("cannot specify both newRaft(peers) and ConfigState.Nodes")
+		}
+		peers = cs.Nodes
+	}
+	r := &Raft{
+		id:               c.ID,
+		Lead:             None,
+		RaftLog:          raftLog,
+		Prs:              make(map[uint64]*Progress),
+		electionTimeout:  c.ElectionTick,
+		heartbeatTimeout: c.HeartbeatTick,
+	}
+	for _, p := range peers {
+		r.Prs[p] = &Progress{Next: 1}
+	}
+	if !IsEmptyHardState(hs) {
+		r.loadState(hs)
+	}
+	if c.Applied > 0 {
+		raftLog.appliedTo(c.Applied)
+	}
+	r.becomeFollower(r.Term, None)
+
+	var nodesStrs []string
+	for _, n := range r.nodes() {
+		nodesStrs = append(nodesStrs, fmt.Sprintf("%x", n))
+	}
+
+	log.Infof("newRaft %x [peers: [%s], term: %d, commit: %d, applied: %d, lastindex: %d]",
+		r.id, strings.Join(nodesStrs, ","), r.Term, r.RaftLog.committed, r.RaftLog.applied, r.RaftLog.LastIndex())
+	return r
+}
+
+func (r *Raft) nodes() []uint64 {
+	nodes := make([]uint64, 0, len(r.Prs))
+	for u := range r.Prs {
+		nodes = append(nodes, u)
+	}
+	sort.Sort(uint64Slice(nodes))
+	return nodes
+}
+
+func (r *Raft) send(m pb.Message) {
+	m.From = r.id
+	if m.MsgType == pb.MessageType_MsgRequestVote {
+		if m.Term == 0 {
+			panic(fmt.Sprintf("term should be set when sending %s", m.MsgType))
+		}
+	} else {
+		if m.Term != 0 {
+			panic(fmt.Sprintf("term should not be set when sending %s (was %d)", m.MsgType, m.Term))
+		}
+		// 转发给leader的消息，不用管这个任期，当作本地消息处理
+		if m.MsgType != pb.MessageType_MsgPropose {
+			m.Term = r.Term
+		}
+	}
+	r.msgs = append(r.msgs, m)
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
+// 向to节点发送RPC消息
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	return false
+	pr := r.Prs[to]
+	m := pb.Message{
+		To: to,
+	}
+	term, errt := r.RaftLog.Term(pr.Next - 1)
+	ents, erre := r.RaftLog.sliceEntries(pr.Next, r.RaftLog.LastIndex()+1)
+	if errt != nil || erre != nil {
+		m.MsgType = pb.MessageType_MsgSnapshot
+		snapshot, err := r.RaftLog.snapshot()
+		if err != nil {
+			if errors.Is(err, ErrSnapshotTemporarilyUnavailable) {
+				log.Debugf("%v failed to send snapshot to %v because snapshot is temporatily unavailable", r.id, to)
+				return false
+			}
+			panic(err)
+		}
+		if IsEmptySnap(&snapshot) {
+			panic("need non-empty snapshot")
+		}
+		m.Snapshot = &snapshot
+		sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
+		log.Debugf("%v [firstIndex: %v, commidId: %v] sent snapshot[index: %v, term: %v] to %v [%v]", r.id, r.RaftLog.firstIndex, r.RaftLog.committed, sindex, sterm, to, pr)
+		// 这里要不要像etcd一样 改变progress的状态呢？
+	} else {
+		m.MsgType = pb.MessageType_MsgAppend
+		m.Index = pr.Next - 1
+		m.LogTerm = term
+		m.Entries = ents
+		m.Commit = r.RaftLog.committed
+		if n := len(m.Entries); n != 0 {
+			pr.Next = m.Entries[n-1].Index + 1
+		}
+	}
+	r.send(m)
+	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
+	r.send(pb.Message{
+		To:      to,
+		MsgType: pb.MessageType_MsgHeartbeat,
+		Commit:  min(r.Prs[to].Match, r.RaftLog.committed),
+	})
 	// Your Code Here (2A).
 }
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
+
 	// Your Code Here (2A).
+}
+
+func (r *Raft) resetRandomizedElectionTimeout() {
+	r.electionTimeout = r.electionTimeout + globalRand.Intn(r.electionTimeout)
+}
+
+// 重置raft的一些状态
+func (r *Raft) reset(term uint64) {
+	if r.Term != term {
+		r.Term = term
+		r.Vote = None
+	}
+	r.Lead = None
+	r.electionElapsed = 0
+	r.heartbeatElapsed = 0
+	r.resetRandomizedElectionTimeout()
+	r.leadTransferee = None
+	r.votes = make(map[uint64]bool)
+	// 非leader节点 充值这个有意义麻？
+	// TODO 为啥不管match？
+	for id := range r.Prs {
+		r.Prs[id] = &Progress{
+			Next: r.RaftLog.LastIndex() + 1,
+		}
+		if id == r.id {
+			r.Prs[id].Match = r.RaftLog.LastIndex()
+		}
+	}
+
 }
 
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
+
 	// Your Code Here (2A).
 }
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
+
 	// Your Code Here (2A).
 }
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
+
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
 }
@@ -215,25 +360,39 @@ func (r *Raft) Step(m pb.Message) error {
 
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
+
 	// Your Code Here (2A).
 }
 
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
+
 	// Your Code Here (2A).
 }
 
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
+
 	// Your Code Here (2C).
 }
 
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
+
 	// Your Code Here (3A).
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
+
 	// Your Code Here (3A).
+}
+
+func (r *Raft) loadState(state pb.HardState) {
+	if state.Commit < r.RaftLog.committed || state.Commit > r.RaftLog.LastIndex() {
+		log.Panicf("%v state.commit %v is out of range [%v, %v]", r.id, state.Commit, r.RaftLog.committed, r.RaftLog.LastIndex())
+	}
+	r.Term = state.Term
+	r.Vote = state.Vote
+	r.RaftLog.committed = state.Commit
 }
