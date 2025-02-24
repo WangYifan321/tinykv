@@ -95,6 +95,15 @@ func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
 }
 
+func (l *RaftLog) maybeCommit(maxIndex, term uint64) bool {
+	// 只有在传入的index大于当前commit索引，以及maxIndex对应的term与传入的term匹配时，才使用这些数据进行commit
+	if maxIndex > l.committed && l.zeroTermOnErrCompacted(l.Term(maxIndex)) == term {
+		l.commitTo(maxIndex)
+		return true
+	}
+	return false
+}
+
 // [lo, hi - 1]
 func (l *RaftLog) sliceEntries(lo uint64, hi uint64) ([]pb.Entry, error) {
 	if lo > l.LastIndex() {
@@ -167,11 +176,26 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	i, err := l.storage.LastIndex()
+	// 感觉应该是数组的最后一个啊
+	//i, err := l.storage.LastIndex()
+	//if err != nil {
+	//	panic(err)
+	//}
+	return l.entries[len(l.entries)-1].Index
+}
+
+// 判断是否比当前节点的日志更新：1）term是否更大 2）term相同的情况下，索引是否更大
+func (l *RaftLog) isUpToDate(lasti, term uint64) bool {
+	return term > l.lastTerm() || (term == l.lastTerm() && lasti >= l.LastIndex())
+}
+
+// 返回最后一个索引的term
+func (l *RaftLog) lastTerm() uint64 {
+	t, err := l.Term(l.LastIndex())
 	if err != nil {
-		panic(err)
+		log.Panicf("unexpected error when getting the last term (%v)", err)
 	}
-	return i
+	return t
 }
 
 // Term return the term of the entry in the given index
@@ -190,6 +214,20 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	return l.entries[i-offset].Term, nil
 }
 
+// 将raftlog的commit索引，修改为tocommit
+func (l *RaftLog) commitTo(tocommit uint64) {
+	// never decrease commit
+	// 首先需要判断，commit索引绝不能变小
+	if l.committed < tocommit {
+		if l.LastIndex() < tocommit {
+			// 传入的值如果比lastIndex大则是非法的
+			log.Panicf("tocommit(%d) is out of range [lastIndex(%d)]. Was the raft log corrupted, truncated, or lost?", tocommit, l.LastIndex())
+		}
+		l.committed = tocommit
+		log.Infof("commit to %d", tocommit)
+	}
+}
+
 // 修改applied索引
 func (l *RaftLog) appliedTo(i uint64) {
 	if i == 0 {
@@ -201,4 +239,63 @@ func (l *RaftLog) appliedTo(i uint64) {
 		log.Panicf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", i, l.applied, l.committed)
 	}
 	l.applied = i
+}
+
+// 添加数据，返回最后一条日志的索引
+func (l *RaftLog) append(ents ...pb.Entry) uint64 {
+	// 没有数据，直接返回最后一条日志索引
+	if len(ents) == 0 {
+		return l.LastIndex()
+	}
+	// 如果索引小于committed，则说明该数据是非法的
+	if after := ents[0].Index - 1; after < l.committed {
+		log.Panicf("after(%d) is out of range [committed(%d)]", after, l.committed)
+	}
+	// 放入unstable存储中
+	l.truncateAndAppend(ents)
+	return l.LastIndex()
+}
+
+// 传入entries，可能会导致原先数据的截断或者添加操作
+// 这就是最开始注释中说明的offset可能比持久化索引小的情况，需要做截断
+func (l *RaftLog) truncateAndAppend(ents []pb.Entry) {
+	if len(ents) == 0 {
+		return
+	}
+
+	first := l.stabled
+	last := ents[0].Index + uint64(len(ents)) - 1
+
+	// shortcut if there is no new entry.
+	if last < first {
+		return
+	}
+	// truncate compacted entries
+	if first > ents[0].Index {
+		ents = ents[first-ents[0].Index:]
+	}
+
+	offset := ents[0].Index - l.firstIndex
+	switch {
+	case uint64(len(l.entries)) > offset:
+		l.entries = append([]pb.Entry{}, l.entries[:offset]...)
+		l.entries = append(l.entries, ents...)
+	case uint64(len(l.entries)) == offset:
+		l.entries = append(l.entries, ents...)
+	default:
+		log.Panicf("missing log entry [last: %d, append at: %d]",
+			l.LastIndex(), ents[0].Index)
+	}
+}
+
+// 如果传入的err是nil，则返回t；如果是ErrCompacted则返回0，其他情况都panic
+func (l *RaftLog) zeroTermOnErrCompacted(t uint64, err error) uint64 {
+	if err == nil {
+		return t
+	}
+	if err == ErrCompacted {
+		return 0
+	}
+	log.Panicf("unexpected error (%v)", err)
+	return 0
 }

@@ -114,6 +114,18 @@ type Progress struct {
 	Match, Next uint64
 }
 
+func (pr *Progress) maybeUpdate(n uint64) bool {
+	var updated bool
+	if pr.Match < n {
+		pr.Match = n
+		updated = true
+	}
+	if pr.Next < n+1 {
+		pr.Next = n + 1
+	}
+	return updated
+}
+
 type Raft struct {
 	id uint64
 
@@ -213,6 +225,9 @@ func newRaft(c *Config) *Raft {
 	return r
 }
 
+// 超过半数的节点数量
+func (r *Raft) quorum() int { return len(r.Prs)/2 + 1 }
+
 func (r *Raft) nodes() []uint64 {
 	nodes := make([]uint64, 0, len(r.Prs))
 	for u := range r.Prs {
@@ -272,7 +287,11 @@ func (r *Raft) sendAppend(to uint64) bool {
 		m.MsgType = pb.MessageType_MsgAppend
 		m.Index = pr.Next - 1
 		m.LogTerm = term
-		m.Entries = ents
+		entries := make([]*pb.Entry, len(ents))
+		for _, v := range ents {
+			entries = append(entries, &v)
+		}
+		m.Entries = entries
 		m.Commit = r.RaftLog.committed
 		if n := len(m.Entries); n != 0 {
 			pr.Next = m.Entries[n-1].Index + 1
@@ -302,6 +321,25 @@ func (r *Raft) resetRandomizedElectionTimeout() {
 	r.electionTimeout = r.electionTimeout + globalRand.Intn(r.electionTimeout)
 }
 
+// maybeCommit attempts to advance the commit index. Returns true if
+// the commit index changed (in which case the caller should call
+// r.bcastAppend).
+// 尝试commit当前的日志，如果commit日志索引发生变化了就返回true
+func (r *Raft) maybeCommit() bool {
+	mis := make(uint64Slice, 0, len(r.Prs))
+	// 拿到当前所有节点的Match到数组中
+	for id := range r.Prs {
+		mis = append(mis, r.Prs[id].Match)
+	}
+	// 逆序排列
+	sort.Sort(sort.Reverse(mis))
+	// 排列之后拿到中位数的Match，因为如果这个位置的Match对应的Term也等于当前的Term
+	// 说明有过半的节点至少comit了mci这个索引的数据，这样leader就可以以这个索引进行commit了
+	mci := mis[r.quorum()-1]
+	// raft日志尝试commit
+	return r.RaftLog.maybeCommit(mci, r.Term)
+}
+
 // 重置raft的一些状态
 func (r *Raft) reset(term uint64) {
 	if r.Term != term {
@@ -327,29 +365,182 @@ func (r *Raft) reset(term uint64) {
 
 }
 
+// 批量append一堆entries
+func (r *Raft) appendEntry(es ...pb.Entry) {
+	li := r.RaftLog.LastIndex()
+	for i := range es {
+		// 设置这些entries的Term以及index
+		es[i].Term = r.Term
+		es[i].Index = li + 1 + uint64(i)
+	}
+	r.RaftLog.append(es...)
+	// 更新本节点的Next以及Match索引
+	r.Prs[r.id].maybeUpdate(r.RaftLog.LastIndex())
+	// Regardless of maybeCommit's return, our caller will call bcastAppend.
+	// append之后，尝试一下是否可以进行commit
+	r.maybeCommit()
+}
+
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
-
 	// Your Code Here (2A).
+	r.reset(term)
+	r.Lead = lead
+	r.State = StateFollower
+	log.Infof("%x became follower at term %d", r.id, r.Term)
 }
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
-
 	// Your Code Here (2A).
+	if r.State == StateLeader {
+		panic("invalid transition [leader -> candidate]")
+	}
+	r.reset(r.Term + 1)
+	r.Vote = r.id
+	r.State = StateCandidate
+	log.Infof("%x became candidate at term %d", r.id, r.Term)
 }
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
-
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+	if r.State == StateFollower {
+		panic("invalid transition [follower -> leader]")
+	}
+	r.reset(r.Term)
+	r.Lead = r.id
+	r.State = StateLeader
+	ents, err := r.RaftLog.sliceEntries(r.RaftLog.committed+1, r.RaftLog.LastIndex()+1)
+	if err != nil {
+		log.Panicf("unexpected error getting uncommitted entries (%v)", err)
+	}
+	// 变成leader之前，这里还有没commit的配置变化消息
+	nconf := numOfPendingConf(ents)
+	if nconf > 1 {
+		panic("unexpected multiple uncommitted config entry")
+	}
+	//if nconf == 1 {
+	//	r.pendingConf = true
+	//}
+	// 为什么成为leader之后需要传入一个空数据？
+	r.appendEntry(pb.Entry{Data: nil})
+	log.Infof("%x became leader at term %d", r.id, r.Term)
+}
+
+func (r *Raft) campaign() {
+	var term uint64
+	var voteMsg pb.MessageType
+	r.becomeCandidate()
+	voteMsg = pb.MessageType_MsgRequestVote
+	term = r.Term + 1
+	// 调用poll函数给自己投票，同时返回当前投票给本节点的节点数量
+	if r.quorum() == r.poll(r.id, pb.MessageType_MsgRequestVoteResponse, true) {
+		// We won the election after voting for ourselves (which must mean that
+		// this is a single-node cluster). Advance to the next state.
+		// 有半数投票，说明通过，切换到下一个状态
+		// 如果给自己投票之后，刚好超过半数的通过，那么就成为新的leader
+		r.becomeLeader()
+		return
+	}
+
+	// 向集群里的其他节点发送投票消息
+	for id := range r.Prs {
+		if id == r.id {
+			// 过滤掉自己
+			continue
+		}
+		log.Infof("%x [logterm: %d, index: %d] sent %s request to %x at term %d",
+			r.id, r.RaftLog.lastTerm(), r.RaftLog.LastIndex(), voteMsg, id, r.Term)
+		r.send(pb.Message{Term: term, To: id, MsgType: voteMsg, Index: r.RaftLog.LastIndex(), LogTerm: r.RaftLog.lastTerm()})
+	}
+}
+
+// 轮询集群中所有节点，返回一共有多少节点已经进行了投票
+func (r *Raft) poll(id uint64, t pb.MessageType, v bool) (granted int) {
+	if v {
+		log.Infof("%x received %s from %x at term %d", r.id, t, id, r.Term)
+	} else {
+		log.Infof("%x received %s rejection from %x at term %d", r.id, t, id, r.Term)
+	}
+	// 如果id没有投票过，那么更新id的投票情况
+	if _, ok := r.votes[id]; !ok {
+		r.votes[id] = v
+	}
+	// 计算下都有多少节点已经投票给自己了
+	for _, vv := range r.votes {
+		if vv {
+			granted++
+		}
+	}
+	return granted
 }
 
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	log.Infof("from:%d, to:%d, type:%s, term:%d, state:%v", m.From, m.To, m.MsgType, r.Term, r.State)
+
+	// 先根据任期做一些统一处理
+	switch {
+	case m.Term == 0:
+		// 收到来自本地的消息
+	case m.Term > r.Term:
+		lead := m.From
+		if m.MsgType == pb.MessageType_MsgRequestVote {
+			if r.Lead != None && r.electionElapsed < r.electionTimeout {
+				log.Infof("lease is not expired")
+				return nil
+			}
+			lead = None
+		}
+		log.Infof("%x [term: %d] received a %s message with higher term from %x [term: %d]",
+			r.id, r.Term, m.MsgType, m.From, m.Term)
+		r.becomeFollower(m.Term, lead)
+	case m.Term < r.Term:
+		log.Infof("%x [term: %d] ignored a %s message with lower term from %x [term: %d]",
+			r.id, r.Term, m.MsgType, m.From, m.Term)
+		return nil
+	}
+
+	// 投票类消息统一处理
+	switch m.MsgType {
+	case pb.MessageType_MsgHup:
+		if r.State != StateLeader {
+			ents, err := r.RaftLog.sliceEntries(r.RaftLog.applied+1, r.RaftLog.committed+1)
+			if err != nil {
+				log.Panicf("unexpected error getting unapplied entries (%v)", err)
+			}
+			// 如果其中有config消息，并且commited > applied，说明当前还有没有apply的config消息，这种情况下不能开始投票 WHY?
+			if n := numOfPendingConf(ents); n != 0 && r.RaftLog.committed > r.RaftLog.applied {
+				log.Warningf("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
+				return nil
+			}
+
+			log.Infof("%x is starting a new election at term %d", r.id, r.Term)
+			// 进行选举
+			r.campaign()
+		} else {
+			log.Debugf("%x ignoring MsgHup because already leader", r.id)
+		}
+	case pb.MessageType_MsgRequestVote:
+		if (r.Vote == None || r.Term < m.Term || r.Vote == m.From) && r.RaftLog.isUpToDate(m.Index, m.LogTerm) {
+			log.Infof("%x [logterm: %d, index: %d, vote: %x] cast %s for %x [logterm: %d, index: %d] at term %d",
+				r.id, r.RaftLog.lastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term)
+			r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse})
+			r.electionElapsed = 0
+			r.Vote = m.From
+		} else {
+			// 否则拒绝投票
+			log.Infof("%x [logterm: %d, index: %d, vote: %x] rejected %s from %x [logterm: %d, index: %d] at term %d",
+				r.id, r.RaftLog.lastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term)
+			r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgRequestVoteResponse, Reject: true})
+		}
+	}
+
+	// 各自处理
 	switch r.State {
 	case StateFollower:
 	case StateCandidate:
@@ -395,4 +586,15 @@ func (r *Raft) loadState(state pb.HardState) {
 	r.Term = state.Term
 	r.Vote = state.Vote
 	r.RaftLog.committed = state.Commit
+}
+
+// 返回消息数组中配置变化的消息数量
+func numOfPendingConf(ents []pb.Entry) int {
+	n := 0
+	for i := range ents {
+		if ents[i].EntryType == pb.EntryType_EntryConfChange {
+			n++
+		}
+	}
+	return n
 }
