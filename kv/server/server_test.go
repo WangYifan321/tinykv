@@ -48,6 +48,7 @@ func cleanUpTestData(conf *config.Config) error {
 }
 
 func TestRawGet1(t *testing.T) {
+	// trigger
 	conf := config.NewTestConfig()
 	s := standalone_storage.NewStandAloneStorage(conf)
 	s.Start()
